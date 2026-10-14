@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>聲音冒險小迷宮</title>
+  <!-- 載入 TensorFlow.js 與 Speech Commands 模型函式庫 -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/speech-commands@0.4.0/dist/speech-commands.min.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #1e1e2f;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      margin: 0;
+    }
+    h1 { margin-bottom: 8px; }
+    #instruction {
+      color: #ccc;
+      margin-bottom: 16px;
+      text-align: center;
+      max-width: 500px;
+      line-height: 1.5;
+    }
+    #game-container {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    canvas {
+      background: #2b2b3d;
+      border: 3px solid #ffcc00;
+      border-radius: 8px;
+    }
+    #dashboard {
+      background: #2b2b3d;
+      padding: 16px;
+      border-radius: 8px;
+      width: 280px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .bar-container {
+      background: #444;
+      border-radius: 4px;
+      overflow: hidden;
+      height: 16px;
+      margin-top: 4px;
+    }
+    .bar {
+      height: 100%;
+      background: #4caf50;
+      width: 0%;
+      transition: width 0.1s linear;
+    }
+    button {
+      padding: 10px 18px;
+      font-size: 16px;
+      background-color: #ff9800;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:hover { background-color: #fb8c00; }
+    button:disabled { background-color: #777; cursor: not-allowed; }
+    #status-msg {
+      font-weight: bold;
+      color: #00e676;
+      min-height: 24px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>聲音冒險小迷宮</h1>
+  <div id="instruction">
+    操作說明：對麥克風發出<b>第一種聲音</b>前進，發出<b>第二種聲音</b>順時針轉向 90 度，避開藍色牆壁走到粉紅色終點！
+  </div>
+
+  <button id="start-btn" onclick="init()">啟動麥克風與遊戲</button>
+
+  <div id="game-container" style="margin-top: 15px;">
+    <!-- 迷宮畫布 -->
+    <canvas id="mazeCanvas" width="400" height="400"></canvas>
+
+    <!-- 信心分數與狀態面板 -->
+    <div id="dashboard">
+      <h3>麥克風即時辨識狀態</h3>
+      <div id="status-msg">請先點擊上方按鈕授權麥克風</div>
+      <div id="labels-container"></div>
+    </div>
+  </div>
+
+  <script>
+    // 已更新為新的模型連結
+    const MODEL_URL = "https://teachablemachine.withgoogle.com/models/jyAulJqiF/";
+
+    let recognizer;
+    let lastActionTime = 0; // 避免聲音持續觸發過快的冷卻機制 (Cooldown)
+
+    // 迷宮地圖 (0: 走道, 1: 牆壁, 2: 終點)
+    const grid = [
+      [1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 0, 0, 0, 1, 0, 2, 1],
+      [1, 1, 1, 0, 1, 0, 1, 1],
+      [1, 0, 0, 0, 0, 0, 0, 1],
+      [1, 0, 1, 1, 1, 1, 0, 1],
+      [1, 0, 1, 0, 0, 0, 0, 1],
+      [1, 0, 0, 0, 1, 1, 0, 1],
+      [1, 1, 1, 1, 1, 1, 1, 1]
+    ];
+    const cellSize = 50;
+
+    // 玩家狀態：位置與朝向 (0: 右, 1: 下, 2: 左, 3: 上)
+    let player = { x: 1, y: 1, dir: 0 };
+    const dx = [1, 0, -1, 0];
+    const dy = [0, 1, 0, -1];
+    const dirNames = ["→ (右)", "↓ (下)", "← (左)", "↑ (上)"];
+
+    const canvas = document.getElementById("mazeCanvas");
+    const ctx = canvas.getContext("2d");
+
+    // 繪製地圖與玩家
+    function drawGame() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          if (grid[r][c] === 1) {
+            ctx.fillStyle = "#3949ab"; // 藍色障礙物
+            ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+          } else if (grid[r][c] === 2) {
+            ctx.fillStyle = "#e91e63"; // 終點寶箱
+            ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+          }
+        }
+      }
+
+      // 玩家圓點
+      const px = player.x * cellSize + cellSize / 2;
+      const py = player.y * cellSize + cellSize / 2;
+
+      ctx.fillStyle = "#00e676";
+      ctx.beginPath();
+      ctx.arc(px, py, cellSize / 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 玩家方向指針
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(px + dx[player.dir] * 18, py + dy[player.dir] * 18);
+      ctx.stroke();
+    }
+
+    // 角色前進
+    function movePlayer() {
+      const nextX = player.x + dx[player.dir];
+      const nextY = player.y + dy[player.dir];
+
+      if (grid[nextY][nextX] === 1) {
+        document.getElementById("status-msg").innerText = "⚠️ 撞牆了！請發出轉向聲音";
+        document.getElementById("status-msg").style.color = "#ff5252";
+        return;
+      }
+
+      player.x = nextX;
+      player.y = nextY;
+      drawGame();
+
+      if (grid[player.y][player.x] === 2) {
+        document.getElementById("status-msg").innerText = "🎉 恭喜通關！太強了！";
+        document.getElementById("status-msg").style.color = "#ffeb3b";
+        setTimeout(() => {
+          alert("🎉 恭喜通關成功！");
+          player.x = 1; player.y = 1; player.dir = 0;
+          drawGame();
+        }, 100);
+      }
+    }
+
+    // 角色轉彎 (順時針 90 度)
+    function turnPlayer() {
+      player.dir = (player.dir + 1) % 4;
+      document.getElementById("status-msg").innerText = `🔄 轉向朝：${dirNames[player.dir]}`;
+      document.getElementById("status-msg").style.color = "#40c4ff";
+      drawGame();
+    }
+
+    // 啟動模型
+    async function init() {
+      document.getElementById("start-btn").disabled = true;
+      document.getElementById("status-msg").innerText = "模型載入中，請稍候...";
+
+      const checkpointURL = MODEL_URL + "model.json";
+      const metadataURL = MODEL_URL + "metadata.json";
+
+      recognizer = speechCommands.create(
+        "BROWSER_FFT",
+        undefined,
+        checkpointURL,
+        metadataURL
+      );
+
+      await recognizer.ensureModelLoaded();
+      const labels = recognizer.wordLabels();
+      const labelsContainer = document.getElementById("labels-container");
+      labelsContainer.innerHTML = "";
+
+      // 動態建立每個類別的信心分數長條圖
+      labels.forEach(label => {
+        const item = document.createElement("div");
+        item.style.marginBottom = "8px";
+        item.innerHTML = `
+          <div style="font-size: 14px;"><b>${label}</b>: <span id="val-${label}">0%</span></div>
+          <div class="bar-container"><div class="bar" id="bar-${label}"></div></div>
+        `;
+        labelsContainer.appendChild(item);
+      });
+
+      document.getElementById("status-msg").innerText = "🟢 聆聽中... 請發出聲音進行操控";
+      drawGame();
+
+      // 監聽聲音
+      recognizer.listen(result => {
+        const scores = result.scores;
+        let maxIndex = 0;
+        let maxScore = 0;
+
+        for (let i = 0; i < scores.length; i++) {
+          const score = scores[i];
+          const percent = Math.round(score * 100);
+          document.getElementById(`val-${labels[i]}`).innerText = percent + "%";
+          document.getElementById(`bar-${labels[i]}`).style.width = percent + "%";
+
+          if (score > maxScore) {
+            maxScore = score;
+            maxIndex = i;
+          }
+        }
+
+        const detected = labels[maxIndex];
+        const now = Date.now();
+
+        // 觸發門檻：信心分數 > 75%，且距離上次觸發超過 400 毫秒
+        if (maxScore > 0.75 && (now - lastActionTime > 400)) {
+          // 排除背景噪音
+          if (!detected.toLowerCase().includes("background")) {
+            // 自動按類別順序或名稱匹配觸發動作
+            if (maxIndex === 1 || detected.includes("走") || detected.includes("前進") || detected.toLowerCase().includes("go")) {
+              movePlayer();
+              lastActionTime = now;
+            } else if (maxIndex === 2 || detected.includes("轉") || detected.includes("拍手") || detected.toLowerCase().includes("turn") || detected.toLowerCase().includes("clap")) {
+              turnPlayer();
+              lastActionTime = now;
+            }
+          }
+        }
+      }, {
+        includeSpectrogram: false,
+        probabilityThreshold: 0.75,
+        invokeCallbackOnNoiseAndUnknown: true,
+        overlapFactor: 0.5
+      });
+    }
+
+    drawGame();
+  </script>
+</body>
+</html>
